@@ -13,6 +13,16 @@ import psutil  # process handling, zombies
 import hpilo
 from _socket import gaierror
 from prometheus_client import generate_latest, Summary, Gauge, CollectorRegistry, REGISTRY
+# for get_ilo_battery_status
+import requests
+import json
+
+#logging
+
+#import logging
+#import sys
+
+#logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 
 def print_err(*args, **kwargs):
@@ -35,6 +45,47 @@ def translate(st):
         return 2
 
 
+def get_ilo_battery_status(host,user,password,ilo_version):
+    # define base URL REST API interface
+    baseURL = 'https://%s/redfish/v1/' % (host)
+    verify_cert = False # Default = False
+
+    # define HTTP content headers
+    header = {}
+    header['Content-Type'] = 'application/json; charset=utf-8'
+    header['Accept'] = 'application/json'
+    payload = {}
+
+    connection = requests.Session()
+    connection.auth = (user, password)
+    requests.packages.urllib3.disable_warnings()
+    if ilo_version == 'iLO4':
+        try:
+            REST = 'Systems/1'
+            completeURL = '%s%s' % (baseURL, REST if REST[0] != '/' else REST[1:])
+            json_text = connection.get(completeURL, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=header, verify=verify_cert).text
+            j = json.loads(json_text)
+            status = j['Oem']['Hp']['Battery'][0]['ErrorCode']
+        except KeyError:
+            status = 2
+    elif ilo_version == 'iLO5':
+        try:
+            REST = 'Chassis/1'
+            completeURL = '%s%s' % (baseURL, REST if REST[0] != '/' else REST[1:])
+            json_text = connection.get(completeURL, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=header, verify=verify_cert).text
+            j = json.loads(json_text)
+            status = translate(j['Oem']['Hpe']['SmartStorageBattery'][0]['Status']['Health'])
+        except Exception as Error:
+            print(f"{Error=}, {type(Error)=}. Looks like battery is missing.")
+            status = 2
+            pass
+    else:
+        print('iLO version not found')
+    connection.close()
+    result=str(status)
+    return result
+
+                                                                                                                                                                        
 class RequestHandler(BaseHTTPRequestHandler):
     """
     Endpoint handler
@@ -52,7 +103,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                          ["product_name", "server_name"], registry=self.registry),
             'drive': Gauge(self.P + 'drive_status', 'HP iLO drive status',
                            ["product_name", "server_name"], registry=self.registry),
-            'battery': Gauge(self.P + 'battery_status', 'HP iLO battery status',
+            #'battery': Gauge(self.P + 'battery_status', 'HP iLO battery status',
+            #                 ["product_name", "server_name"], registry=self.registry),
+            'battery_custom': Gauge(self.P + 'battery_status_custom', 'HP iLO battery status custom. 0 = OK, 2 = battery is missing, 15 = battery in pre-failed state.',
                              ["product_name", "server_name"], registry=self.registry),
             'battery_detail': Gauge(self.P + 'battery_detail', 'HP iLO battery status  0 = OK, 1 = DEGRADED', ["label", "present", "status", "model", "spare", "serial_number", "capacity", "firmware_version", "product_name", "server_name"], registry=self.registry),
             'storage': Gauge(self.P + 'storage_status', 'HP iLO storage status',
@@ -77,7 +130,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             'temperature': Gauge(self.P + 'temperature_status', 'HP iLO temperature status',
                                  ["product_name", "server_name"], registry=self.registry),
             'firmware_version': Gauge(self.P + 'firmware_version', 'HP iLO firmware version',
-                                      ["product_name", "server_name"], registry=self.registry),
+                                      ["product_name", "server_name","ilo_version","serial_number","ip_address"], registry=self.registry),
             'nic_status': Gauge(self.P + 'nic_status', 'HP iLO NIC status',
                                 ["product_name", "server_name", "nic_name", "ip_address"], registry=self.registry),
             'storage_cache_health': Gauge(self.P + 'storage_cache_health_status', 'Cache Module status',
@@ -93,7 +146,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             'storage_pd_health': Gauge(self.P + 'storage_pd_health_status', 'PD status',
                                        ["product_name", "server_name", "controller", "logical_drive", "physical_drive"],
                                        registry=self.registry),
-            'temperature_value': Gauge(self.P + 'temperature_value', 'Temperature value',
+            'temperature_currentreading': Gauge(self.P + 'temperature_currentreading', 'Temperature currentreading value',
+                                       ["product_name", "server_name", "sensor"], registry=self.registry),
+            'temperature_caution': Gauge(self.P + 'temperature_caution', 'Temperature caution value',
+                                       ["product_name", "server_name", "sensor"], registry=self.registry),
+            'temperature_critical': Gauge(self.P + 'temperature_critical', 'Temperature caution value',
                                        ["product_name", "server_name", "sensor"], registry=self.registry),
             'fan': Gauge(self.P + 'fan_status', 'HP iLO one fan status',
                          ["product_name", "server_name", "fan"], registry=self.registry),
@@ -112,10 +169,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         health_at_glance = self.embedded_health['health_at_a_glance']
         if health_at_glance is not None:
             for key, value in health_at_glance.items():
-                for status in value.items():
-                    if status[0] == 'status':
-                        health = status[1].upper()
-                        self.gauges[key].labels(product_name=self.product_name,
+                if key != 'battery': # custom function for battery status
+                    for status in value.items():
+                        if status[0] == 'status':
+                            health = status[1].upper()
+                            self.gauges[key].labels(product_name=self.product_name,
                                                 server_name=self.server_name).set(translate(health))
 
     def watch_temperature(self):
@@ -125,7 +183,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 s_name = t_key
                 s_value = t_value.get('currentreading', 'N/A')
                 if type(s_value[0]) is int:
-                    self.gauges['temperature_value'].labels(product_name=self.product_name,
+                    self.gauges['temperature_currentreading'].labels(product_name=self.product_name,
+                                                            server_name=self.server_name,
+                                                            sensor=s_name).set(int(s_value[0]))
+                s_value = t_value.get('caution', 'N/A')
+                if type(s_value[0]) is int:
+                    self.gauges['temperature_caution'].labels(product_name=self.product_name,
+                                                            server_name=self.server_name,
+                                                            sensor=s_name).set(int(s_value[0]))
+                s_value = t_value.get('critical', 'N/A')
+                if type(s_value[0]) is int:
+                    self.gauges['temperature_critical'].labels(product_name=self.product_name,
                                                             server_name=self.server_name,
                                                             sensor=s_name).set(int(s_value[0]))
 
@@ -246,6 +314,39 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 pd_key = pd_key + 1
                         ld_key = ld_key + 1
 
+    #def get_ilo_battery_status(host,user,password,ilo_version):
+    #    # define base URL REST API interface
+    #    baseURL = 'https://%s/redfish/v1/' % (host)
+    #    verify_cert = False # Default = False
+
+    #    # define HTTP content headers
+    #    header = {}
+    #    header['Content-Type'] = 'application/json; charset=utf-8'
+    #    header['Accept'] = 'application/json'
+    #    payload = {}
+
+    #    connection = requests.Session()
+    #    connection.auth = (user, password)
+    #    requests.packages.urllib3.disable_warnings()
+    #    if ilo_version == 'iLO4':
+    #        REST = 'Systems/1'
+    #        completeURL = '%s%s' % (baseURL, REST if REST[0] != '/' else REST[1:])
+    #        json_text = connection.get(completeURL, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=header, verify=verify_cert).text
+    #        j = json.loads(json_text)
+    #        status = j['Oem']['Hp']['Battery'][0]['ErrorCode']
+    #    elif ilo_version == 'iLO5':
+    #        REST = 'Chassis/1'
+    #        completeURL = '%s%s' % (baseURL, REST if REST[0] != '/' else REST[1:])
+    #        json_text = connection.get(completeURL, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=header, verify=verify_cert).text
+    #        j = json.loads(json_text)
+    #        status = translate(j['Oem']['Hpe']['SmartStorageBattery'][0]['Status']['Health'])
+    #    else:
+    #        print('')
+    #    #connection.close()
+    #    result=str(status)
+
+    #    return result
+    
     def return_error(self):
         self.send_response(500)
         self.end_headers()
@@ -355,15 +456,39 @@ class RequestHandler(BaseHTTPRequestHandler):
                     except ValueError:
                         value = 4
                         print_err('unrecognised nic status: {}'.format(nic['status']))
-
                     self.gauges['nic_status'].labels(product_name=self.product_name, server_name=self.server_name,
                                                      nic_name=nic_name, ip_address=nic['ip_address']).set(value)
+            
+             ## get a serial number
+            try:
+                host_data = ilo.get_host_data() #get_server_name() #get_product_name() #get_network_settings() #get_host_power_status() #get_power_readings()
+                for x in host_data:
+                    for k, v in x.items():
+                        if k == "Serial Number":
+                            serial_number = v
+            except:
+                print("No serial number for this host")
+                serial_number = ""
+
+            # get an ip address
+            try:
+                host_network_data = ilo.get_network_settings()
+                for k,v in host_network_data.items():
+                    if k == "ip_address":
+                        ip_address = v
+            except:
+                print("No IP address for this host")
+                ip_address = ""
 
             # get firmware version
             try:
                 fw_version = ilo.get_fw_version()["firmware_version"]
+                ilo_version = ilo.get_fw_version()["management_processor"]
                 self.gauges['firmware_version'].labels(product_name=self.product_name,
-                                                       server_name=self.server_name).set(fw_version)
+                                                       server_name=self.server_name,
+                                                       ilo_version=ilo_version,
+                                                       serial_number=serial_number,
+                                                       ip_address=ip_address).set(fw_version)
             except Exception:
                 pass
 
@@ -378,7 +503,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            # get the amount of time the request took
+            # get battery status custom
+            #print(ilo_host,ilo_user,ilo_password,ilo_version)
+            #print(get_ilo_battery_status(ilo_host,ilo_user,ilo_password,ilo_version))
+            try:
+                battery_status_custom = get_ilo_battery_status(ilo_host,ilo_user,ilo_password,ilo_version)
+                # print(battery_status_custom)
+                self.gauges['battery_custom'].labels(product_name=self.product_name,server_name=self.server_name).set(battery_status_custom)
+            except Exception:
+                pass
+
+           # get the amount of time the request took
             request_time.observe(time.time() - start_time)
 
             # generate and publish metrics
